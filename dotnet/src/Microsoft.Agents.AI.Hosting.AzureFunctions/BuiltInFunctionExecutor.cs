@@ -25,6 +25,44 @@ internal sealed class BuiltInFunctionExecutor : IFunctionExecutor
         IFunctionInputBindingFeature? functionInputBindingFeature = context.Features.Get<IFunctionInputBindingFeature>() ??
             throw new InvalidOperationException("Function input binding feature is not available on the current context.");
 
+        if (context.FunctionDefinition.EntryPoint == BuiltInFunctions.InvokeWorkflowActivityFunctionEntryPoint)
+        {
+            // Bind all inputs to get the input string and DurableTaskClient
+            FunctionInputBindingResult? bindingResults = await functionInputBindingFeature.BindFunctionInputAsync(context);
+            if (bindingResults is not { Values: { } activityBindings })
+            {
+                throw new InvalidOperationException($"Function input binding failed for the invocation {context.InvocationId}");
+            }
+
+            DurableTaskClient? activityDurableTaskClient = null;
+            string? activityInput = null;
+            foreach (object? binding in activityBindings)
+            {
+                if (binding is string stringInput)
+                {
+                    activityInput = stringInput;
+                }
+
+                if (binding is DurableTaskClient client)
+                {
+                    activityDurableTaskClient = client;
+                }
+            }
+
+            if (activityInput is null)
+            {
+                throw new InvalidOperationException($"Activity input binding is missing for the invocation {context.InvocationId}.");
+            }
+
+            if (activityDurableTaskClient is null)
+            {
+                throw new InvalidOperationException($"DurableTaskClient binding is missing for the invocation {context.InvocationId}.");
+            }
+
+            context.GetInvocationResult().Value = await BuiltInFunctions.InvokeWorkflowActivityAsync(activityInput, activityDurableTaskClient, context);
+            return;
+        }
+
         FunctionInputBindingResult? inputBindingResults = await functionInputBindingFeature.BindFunctionInputAsync(context);
         if (inputBindingResults is not { Values: { } values })
         {
@@ -99,6 +137,32 @@ internal sealed class BuiltInFunctionExecutor : IFunctionExecutor
 
             context.GetInvocationResult().Value =
                 await BuiltInFunctions.RunMcpToolAsync(mcpToolInvocationContext, durableTaskClient, context);
+            return;
+        }
+
+        if (context.FunctionDefinition.EntryPoint == BuiltInFunctions.RunWorkflowOrechstrtationHttpFunctionEntryPoint)
+        {
+            if (httpRequestData == null)
+            {
+                throw new InvalidOperationException($"HTTP request data binding is missing for the invocation {context.InvocationId}.");
+            }
+
+            context.GetInvocationResult().Value = await BuiltInFunctions.RunWorkflowOrechstrtationHttpTriggerAsync(
+                   httpRequestData,
+                   durableTaskClient,
+                   context);
+            return;
+        }
+
+        // Handle workflow MCP tool trigger
+        if (context.FunctionDefinition.EntryPoint == BuiltInFunctions.RunWorkflowMcpToolFunctionEntryPoint)
+        {
+            if (mcpToolInvocationContext is null)
+            {
+                throw new InvalidOperationException($"MCP tool invocation context binding is missing for the invocation {context.InvocationId}.");
+            }
+
+            context.GetInvocationResult().Value = await BuiltInFunctions.RunWorkflowMcpToolAsync(mcpToolInvocationContext, durableTaskClient, context);
             return;
         }
 

@@ -1,0 +1,14 @@
+# Default endpoint address for local testing
+@authority=http://localhost:7071
+
+### Look up a long order reference id
+POST {{authority}}/api/workflows/FulfillOrder/run
+Content-Type: text/plain
+
+QWERTY80853
+
+### Look up a short order id
+POST {{authority}}/api/workflows/CancelOrder/run
+Content-Type: text/plain
+
+12345

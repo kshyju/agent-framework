@@ -1,33 +1,33 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
-using System.Text.Json;
-using Microsoft.Extensions.AI;
+//using System.Text.Json;
+//using Microsoft.Extensions.AI;
 
-namespace Microsoft.Agents.AI.Hosting.AzureFunctions.UnitTests;
+//namespace Microsoft.Agents.AI.Hosting.AzureFunctions.UnitTests;
 
-internal sealed class TestAgent(string name, string description) : AIAgent
-{
-    public override string? Name => name;
+//internal sealed class TestAgent(string name, string description) : AIAgent
+//{
+//    public override string? Name => name;
 
-    public override string? Description => description;
+//    public override string? Description => description;
 
-    public override ValueTask<AgentSession> GetNewSessionAsync(CancellationToken cancellationToken = default) => new(new DummyAgentSession());
+//    public override ValueTask<AgentSession> GetNewSessionAsync(CancellationToken cancellationToken = default) => new(new DummyAgentSession());
 
-    public override ValueTask<AgentSession> DeserializeSessionAsync(
-        JsonElement serializedSession,
-        JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default) => new(new DummyAgentSession());
+//    public override ValueTask<AgentSession> DeserializeSessionAsync(
+//        JsonElement serializedSession,
+//        JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default) => new(new DummyAgentSession());
 
-    protected override Task<AgentResponse> RunCoreAsync(
-        IEnumerable<ChatMessage> messages,
-        AgentSession? session = null,
-        AgentRunOptions? options = null,
-        CancellationToken cancellationToken = default) => Task.FromResult(new AgentResponse([.. messages]));
+//    protected override Task<AgentResponse> RunCoreAsync(
+//        IEnumerable<ChatMessage> messages,
+//        AgentSession? session = null,
+//        AgentRunOptions? options = null,
+//        CancellationToken cancellationToken = default) => Task.FromResult(new AgentResponse([.. messages]));
 
-    protected override IAsyncEnumerable<AgentResponseUpdate> RunCoreStreamingAsync(
-        IEnumerable<ChatMessage> messages,
-        AgentSession? session = null,
-        AgentRunOptions? options = null,
-        CancellationToken cancellationToken = default) => throw new NotSupportedException();
+//    protected override IAsyncEnumerable<AgentResponseUpdate> RunCoreStreamingAsync(
+//        IEnumerable<ChatMessage> messages,
+//        AgentSession? session = null,
+//        AgentRunOptions? options = null,
+//        CancellationToken cancellationToken = default) => throw new NotSupportedException();
 
-    private sealed class DummyAgentSession : AgentSession;
-}
+//    private sealed class DummyAgentSession : AgentSession;
+//}

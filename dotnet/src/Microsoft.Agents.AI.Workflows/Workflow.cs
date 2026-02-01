@@ -62,6 +62,15 @@ public class Workflow
     }
 
     /// <summary>
+    /// Gets the set of executor IDs that are registered as output sources via <see cref="WorkflowBuilder.WithOutputFrom"/>.
+    /// </summary>
+    /// <returns>A copy of the output executor IDs set. Modifications do not affect the workflow.</returns>
+    public HashSet<string> ReflectOutputExecutors()
+    {
+        return new HashSet<string>(this.OutputExecutors);
+    }
+
+    /// <summary>
     /// Gets the identifier of the starting executor of the workflow.
     /// </summary>
     public string StartExecutorId { get; }
