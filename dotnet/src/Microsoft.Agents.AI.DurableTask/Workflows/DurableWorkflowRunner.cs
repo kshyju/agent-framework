@@ -326,7 +326,7 @@ internal class DurableWorkflowRunner
     }
 
     /// <summary>
-    /// Executes a workflow by building an execution plan and delegating to message-driven execution.
+    /// Executes a workflow using message-driven superstep execution.
     /// </summary>
     /// <param name="context">The Durable Task orchestration context.</param>
     /// <param name="workflow">The workflow definition to execute.</param>
@@ -334,10 +334,14 @@ internal class DurableWorkflowRunner
     /// <param name="logger">The replay-safe logger for orchestration logging.</param>
     /// <returns>The final result of the workflow execution.</returns>
     /// <remarks>
-    /// This method serves as the entry point for workflow execution after the workflow has been
-    /// resolved from the orchestration name. It builds a <see cref="WorkflowExecutionPlan"/> that
-    /// contains the graph structure (successors, predecessors), edge conditions, and executor
-    /// output types needed for message routing.
+    /// <para>
+    /// This method builds a <see cref="WorkflowGraphInfo"/> and creates a durable edge map
+    /// for message-driven execution.
+    /// </para>
+    /// <para>
+    /// Unlike level-based execution, this approach naturally handles cyclic workflows
+    /// by routing messages through edges based on the current state of message queues.
+    /// </para>
     /// </remarks>
     private async Task<string> ExecuteWorkflowAsync(
         TaskOrchestrationContext context,
@@ -345,11 +349,10 @@ internal class DurableWorkflowRunner
         string initialInput,
         ILogger logger)
     {
-        WorkflowExecutionPlan plan = WorkflowHelper.GetExecutionPlan(workflow);
+        WorkflowGraphInfo graphInfo = WorkflowHelper.BuildGraphInfo(workflow);
+        EdgeRouters.DurableEdgeMap edgeMap = new(graphInfo);
 
-        // Use superstep-based execution for all workflows
-        // This approach naturally handles both DAGs and cyclic workflows
-        return await this.RunSuperstepLoopAsync(context, workflow, plan, initialInput, logger).ConfigureAwait(true);
+        return await this.RunSuperstepLoopAsync(context, workflow, edgeMap, initialInput, logger).ConfigureAwait(true);
     }
 
     /// <summary>
@@ -365,14 +368,14 @@ internal class DurableWorkflowRunner
     private async Task<string> RunSuperstepLoopAsync(
         TaskOrchestrationContext context,
         Workflow workflow,
-        WorkflowExecutionPlan plan,
+        EdgeRouters.DurableEdgeMap edgeMap,
         string initialInput,
         ILogger logger)
     {
         const int MaxSupersteps = 100;
 
-        SuperstepState state = new(workflow, plan);
-        EnqueueMessage(state.MessageQueues, plan.StartExecutorId, initialInput, typeof(string).FullName);
+        SuperstepState state = new(workflow, edgeMap);
+        edgeMap.EnqueueInput(initialInput, typeof(string).FullName, state.MessageQueues);
 
         for (int superstep = 1; superstep <= MaxSupersteps; superstep++)
         {
@@ -386,7 +389,7 @@ internal class DurableWorkflowRunner
 
             // Dispatch all executors in parallel
             Task<string>[] tasks = inputs
-                .Select(e => this.DispatchExecutorAsync(context, e.Info, e.Input, e.InputTypeName, logger, state.CustomStatus, state.SharedState))
+                .Select(e => this.DispatchExecutorAsync(context, e.Info, e.Envelope.Message, e.Envelope.InputTypeName, logger, state.CustomStatus, state.SharedState))
                 .ToArray();
 
             string[] results = await Task.WhenAll(tasks).ConfigureAwait(true);
@@ -407,11 +410,11 @@ internal class DurableWorkflowRunner
     /// <summary>
     /// Holds mutable state for superstep-based workflow execution.
     /// </summary>
-    private sealed class SuperstepState(Workflow workflow, WorkflowExecutionPlan plan)
+    private sealed class SuperstepState(Workflow workflow, EdgeRouters.DurableEdgeMap edgeMap)
     {
-        public WorkflowExecutionPlan Plan { get; } = plan;
+        public EdgeRouters.DurableEdgeMap EdgeMap { get; } = edgeMap;
         public Dictionary<string, ExecutorBinding> ExecutorBindings { get; } = workflow.ReflectExecutors();
-        public Dictionary<string, Queue<(string Message, string? InputTypeName)>> MessageQueues { get; } = [];
+        public Dictionary<string, Queue<DurableMessageEnvelope>> MessageQueues { get; } = [];
         public Dictionary<string, string> LastResults { get; } = [];
         public Dictionary<string, string> SharedState { get; } = [];
         public DurableWorkflowCustomStatus CustomStatus { get; } = new();
@@ -420,7 +423,7 @@ internal class DurableWorkflowRunner
     /// <summary>
     /// Represents prepared input for an executor ready for dispatch.
     /// </summary>
-    private sealed record ExecutorInput(string ExecutorId, string Input, string? InputTypeName, WorkflowExecutorInfo Info);
+    private sealed record ExecutorInput(string ExecutorId, DurableMessageEnvelope Envelope, WorkflowExecutorInfo Info);
 
     /// <summary>
     /// Prepares inputs for all active executors, handling Fan-In aggregation.
@@ -429,19 +432,19 @@ internal class DurableWorkflowRunner
     {
         List<ExecutorInput> inputs = [];
 
-        foreach ((string executorId, Queue<(string Message, string? InputTypeName)> queue) in state.MessageQueues)
+        foreach ((string executorId, Queue<DurableMessageEnvelope> queue) in state.MessageQueues)
         {
             if (queue.Count == 0)
             {
                 continue;
             }
 
-            bool isFanIn = state.Plan.Predecessors.TryGetValue(executorId, out List<string>? predecessors) && predecessors.Count > 1;
-            (string input, string? inputTypeName) = isFanIn && queue.Count > 1
+            bool isFanIn = state.EdgeMap.IsFanInExecutor(executorId);
+            DurableMessageEnvelope envelope = isFanIn && queue.Count > 1
                 ? AggregateQueueMessages(queue, executorId, logger)
                 : queue.Dequeue();
 
-            inputs.Add(new ExecutorInput(executorId, input, inputTypeName, CreateExecutorInfo(executorId, state.ExecutorBindings)));
+            inputs.Add(new ExecutorInput(executorId, envelope, CreateExecutorInfo(executorId, state.ExecutorBindings)));
         }
 
         return inputs;
@@ -450,19 +453,33 @@ internal class DurableWorkflowRunner
     /// <summary>
     /// Aggregates all messages in a queue into a JSON array for Fan-In executors.
     /// </summary>
-    private static (string Input, string? TypeName) AggregateQueueMessages(
-        Queue<(string Message, string? InputTypeName)> queue,
+    private static DurableMessageEnvelope AggregateQueueMessages(
+        Queue<DurableMessageEnvelope> queue,
         string executorId,
         ILogger logger)
     {
         List<string> messages = [];
+        List<string> sources = [];
+
         while (queue.Count > 0)
         {
-            messages.Add(queue.Dequeue().Message);
+            DurableMessageEnvelope env = queue.Dequeue();
+            messages.Add(env.Message);
+            if (env.SourceExecutorId is not null)
+            {
+                sources.Add(env.SourceExecutorId);
+            }
         }
 
-        logger.LogDebug("Fan-In executor {ExecutorId}: aggregated {Count} messages", executorId, messages.Count);
-        return (AggregateMessagesToJsonArray(messages), typeof(string[]).FullName);
+        logger.LogDebug("Fan-In executor {ExecutorId}: aggregated {Count} messages from [{Sources}]",
+            executorId, messages.Count, string.Join(", ", sources));
+
+        return new DurableMessageEnvelope
+        {
+            Message = AggregateMessagesToJsonArray(messages),
+            InputTypeName = typeof(string[]).FullName,
+            SourceExecutorId = sources.Count > 0 ? string.Join(",", sources) : null
+        };
     }
 
     /// <summary>
@@ -509,13 +526,13 @@ internal class DurableWorkflowRunner
             {
                 if (!string.IsNullOrEmpty(msg.Message))
                 {
-                    RouteMessageToSuccessors(executorId, msg.Message, msg.TypeName, state.Plan, state.MessageQueues, logger);
+                    state.EdgeMap.RouteMessage(executorId, msg.Message, msg.TypeName, state.MessageQueues, logger);
                 }
             }
         }
         else if (!string.IsNullOrEmpty(result))
         {
-            RouteMessageToSuccessors(executorId, result, state.Plan, state.MessageQueues, logger);
+            state.EdgeMap.RouteMessage(executorId, result, null, state.MessageQueues, logger);
         }
     }
 
@@ -529,32 +546,6 @@ internal class DurableWorkflowRunner
     private static string AggregateMessagesToJsonArray(List<string> messages)
     {
         return JsonSerializer.Serialize(messages);
-    }
-
-    /// <summary>
-    /// Enqueues a message to an executor's message queue with type information.
-    /// </summary>
-    /// <param name="queues">The dictionary of message queues, keyed by executor ID.</param>
-    /// <param name="executorId">The target executor ID to queue the message for.</param>
-    /// <param name="message">The serialized message content.</param>
-    /// <param name="inputTypeName">The full type name of the message, used for deserialization hints.</param>
-    /// <remarks>
-    /// Creates a new queue for the executor if one doesn't exist. Messages are processed
-    /// in FIFO order during each superstep.
-    /// </remarks>
-    private static void EnqueueMessage(
-        Dictionary<string, Queue<(string Message, string? InputTypeName)>> queues,
-        string executorId,
-        string message,
-        string? inputTypeName)
-    {
-        if (!queues.TryGetValue(executorId, out Queue<(string, string?)>? queue))
-        {
-            queue = new Queue<(string, string?)>();
-            queues[executorId] = queue;
-        }
-
-        queue.Enqueue((message, inputTypeName));
     }
 
     /// <summary>
@@ -618,149 +609,6 @@ internal class DurableWorkflowRunner
         }
 
         return false;
-    }
-
-    /// <summary>
-    /// Routes a message through edges to successor executors.
-    /// </summary>
-    /// <param name="sourceId">The source executor ID.</param>
-    /// <param name="message">The serialized message to route.</param>
-    /// <param name="plan">The workflow execution plan.</param>
-    /// <param name="messageQueues">The message queues for each executor.</param>
-    /// <param name="logger">The logger instance.</param>
-    [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Deserializing workflow types registered at startup.")]
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Deserializing workflow types registered at startup.")]
-    private static void RouteMessageToSuccessors(
-        string sourceId,
-        string message,
-        WorkflowExecutionPlan plan,
-        Dictionary<string, Queue<(string Message, string? InputTypeName)>> messageQueues,
-        ILogger logger)
-    {
-        plan.ExecutorOutputTypes.TryGetValue(sourceId, out Type? sourceOutputType);
-        RouteMessageToSuccessorsCore(sourceId, message, sourceOutputType?.FullName, sourceOutputType, plan, messageQueues, logger);
-    }
-
-    /// <summary>
-    /// Routes a message through edges to successor executors, with an explicit type name.
-    /// Used for messages sent via SendMessageAsync.
-    /// </summary>
-    [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Deserializing workflow types registered at startup.")]
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Deserializing workflow types registered at startup.")]
-    [UnconditionalSuppressMessage("Trimming", "IL2057", Justification = "Type resolution for workflow message types.")]
-    private static void RouteMessageToSuccessors(
-        string sourceId,
-        string message,
-        string? explicitTypeName,
-        WorkflowExecutionPlan plan,
-        Dictionary<string, Queue<(string Message, string? InputTypeName)>> messageQueues,
-        ILogger logger)
-    {
-        Type? messageType = !string.IsNullOrEmpty(explicitTypeName) ? Type.GetType(explicitTypeName) : null;
-        string? inputTypeName = explicitTypeName;
-
-        if (messageType is null && plan.ExecutorOutputTypes.TryGetValue(sourceId, out Type? sourceOutputType))
-        {
-            messageType = sourceOutputType;
-            inputTypeName = sourceOutputType?.FullName;
-        }
-
-        RouteMessageToSuccessorsCore(sourceId, message, inputTypeName, messageType, plan, messageQueues, logger);
-    }
-
-    /// <summary>
-    /// Core implementation for routing messages to successor executors.
-    /// </summary>
-    /// <param name="sourceId">The source executor ID that produced the message.</param>
-    /// <param name="message">The serialized message content to route.</param>
-    /// <param name="inputTypeName">The type name to pass to successors for deserialization.</param>
-    /// <param name="messageType">The resolved <see cref="Type"/> for edge condition evaluation.</param>
-    /// <param name="plan">The workflow execution plan containing the graph structure.</param>
-    /// <param name="messageQueues">The message queues to enqueue messages into.</param>
-    /// <param name="logger">The logger for debug output.</param>
-    /// <remarks>
-    /// For each successor of the source executor, this method:
-    /// <list type="number">
-    /// <item><description>Evaluates the edge condition (if any)</description></item>
-    /// <item><description>Enqueues the message if the condition passes or no condition exists</description></item>
-    /// </list>
-    /// </remarks>
-    [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Deserializing workflow types registered at startup.")]
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Deserializing workflow types registered at startup.")]
-    private static void RouteMessageToSuccessorsCore(
-        string sourceId,
-        string message,
-        string? inputTypeName,
-        Type? messageType,
-        WorkflowExecutionPlan plan,
-        Dictionary<string, Queue<(string Message, string? InputTypeName)>> messageQueues,
-        ILogger logger)
-    {
-        if (!plan.Successors.TryGetValue(sourceId, out List<string>? successors))
-        {
-            return;
-        }
-
-        foreach (string sinkId in successors)
-        {
-            if (!TryEvaluateEdgeCondition(sourceId, sinkId, message, messageType, plan, logger))
-            {
-                continue;
-            }
-
-            logger.LogDebug("Edge {Source} -> {Sink}: routing message", sourceId, sinkId);
-            EnqueueMessage(messageQueues, sinkId, message, inputTypeName);
-        }
-    }
-
-    /// <summary>
-    /// Evaluates an edge condition if one exists for the given source-sink pair.
-    /// </summary>
-    /// <param name="sourceId">The source executor ID.</param>
-    /// <param name="sinkId">The target (sink) executor ID.</param>
-    /// <param name="message">The serialized message to evaluate.</param>
-    /// <param name="messageType">The type to deserialize the message to for condition evaluation.</param>
-    /// <param name="plan">The execution plan containing edge conditions.</param>
-    /// <param name="logger">The logger for debug/warning output.</param>
-    /// <returns>
-    /// <c>true</c> if the message should be routed (no condition exists or condition passed);
-    /// <c>false</c> if the condition returned false or evaluation failed.
-    /// </returns>
-    /// <remarks>
-    /// Edge conditions are user-defined predicates that filter which messages flow through an edge.
-    /// If evaluation throws an exception, the edge is skipped (fail-safe behavior) and a warning is logged.
-    /// </remarks>
-    [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Deserializing workflow types registered at startup.")]
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Deserializing workflow types registered at startup.")]
-    private static bool TryEvaluateEdgeCondition(
-        string sourceId,
-        string sinkId,
-        string message,
-        Type? messageType,
-        WorkflowExecutionPlan plan,
-        ILogger logger)
-    {
-        if (!plan.EdgeConditions.TryGetValue((sourceId, sinkId), out Func<object?, bool>? condition) || condition is null)
-        {
-            return true;
-        }
-
-        try
-        {
-            object? messageObj = DeserializeMessageForCondition(message, messageType);
-            if (!condition(messageObj))
-            {
-                logger.LogDebug("Edge {Source} -> {Sink}: condition returned false, skipping", sourceId, sinkId);
-                return false;
-            }
-
-            return true;
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "Failed to evaluate condition for edge {Source} -> {Sink}, skipping", sourceId, sinkId);
-            return false;
-        }
     }
 
     /// <summary>
@@ -1037,43 +885,6 @@ internal class DurableWorkflowRunner
         if (customStatus.Events.Count > 0 || customStatus.PendingEvent is not null)
         {
             context.SetCustomStatus(customStatus);
-        }
-    }
-
-    /// <summary>
-    /// Deserializes a JSON message string into an object for edge condition evaluation.
-    /// </summary>
-    /// <param name="json">The JSON string to deserialize.</param>
-    /// <param name="targetType">The target type to deserialize to, or <c>null</c> to deserialize as <see cref="object"/>.</param>
-    /// <returns>
-    /// The deserialized object, or the original string if deserialization fails (graceful fallback).
-    /// </returns>
-    /// <remarks>
-    /// This method is used to prepare the message for edge condition predicates.
-    /// If the JSON is invalid, it returns the raw string to allow conditions to handle string inputs.
-    /// </remarks>
-    [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Deserializing workflow types registered at startup.")]
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Deserializing workflow types registered at startup.")]
-    private static object? DeserializeMessageForCondition(string json, Type? targetType)
-    {
-        if (string.IsNullOrEmpty(json))
-        {
-            return null;
-        }
-
-        try
-        {
-            if (targetType is null)
-            {
-                return JsonSerializer.Deserialize<object>(json);
-            }
-
-            return JsonSerializer.Deserialize(json, targetType);
-        }
-        catch (JsonException)
-        {
-            // If it's not valid JSON, return the string as-is
-            return json;
         }
     }
 

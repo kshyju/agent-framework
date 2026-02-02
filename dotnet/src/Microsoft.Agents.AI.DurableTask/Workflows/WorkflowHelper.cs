@@ -1,6 +1,5 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
-using System.Diagnostics;
 using Microsoft.Agents.AI.Workflows;
 
 namespace Microsoft.Agents.AI.DurableTask.Workflows;
@@ -12,7 +11,6 @@ namespace Microsoft.Agents.AI.DurableTask.Workflows;
 /// <param name="IsAgenticExecutor">Indicates whether this executor is an agentic executor.</param>
 /// <param name="RequestPort">The request port if this executor is a request port executor; otherwise, null.</param>
 /// <param name="SubWorkflow">The sub-workflow if this executor is a sub-workflow executor; otherwise, null.</param>
-[DebuggerDisplay("{ExecutorId}, Agentic = {IsAgenticExecutor}, HITL = {IsRequestPortExecutor}, SubWorkflow = {IsSubworkflowExecutor}")]
 internal sealed record WorkflowExecutorInfo(string ExecutorId, bool IsAgenticExecutor, RequestPort? RequestPort = null, Workflow? SubWorkflow = null)
 {
     /// <summary>
@@ -27,271 +25,99 @@ internal sealed record WorkflowExecutorInfo(string ExecutorId, bool IsAgenticExe
 }
 
 /// <summary>
-/// Represents a level of executors that can be executed in parallel (Fan-Out).
-/// All executors in the same level have their dependencies satisfied by previous levels.
-/// </summary>
-/// <param name="Level">The level number (0-based, starting from the root executor).</param>
-/// <param name="Executors">The executors that can run in parallel at this level.</param>
-/// <param name="IsFanIn">Indicates if this level is a Fan-In point (has executors with multiple predecessors).</param>
-[DebuggerDisplay("Level {Level}: {Executors.Count} executor(s), FanIn = {IsFanIn}")]
-internal sealed record WorkflowExecutionLevel(int Level, List<WorkflowExecutorInfo> Executors, bool IsFanIn);
-
-/// <summary>
 /// Provides helper methods for analyzing and executing workflows.
 /// </summary>
 internal static class WorkflowHelper
 {
     /// <summary>
-    /// Accepts a workflow instance and returns a list of executors with metadata in the order they should be executed.
+    /// Accepts a workflow instance and returns a list of executors with metadata.
     /// </summary>
     /// <param name="workflow">The workflow instance to analyze.</param>
-    /// <returns>A list of executor information in topological order (execution order).</returns>
+    /// <returns>A list of executor information.</returns>
     public static List<WorkflowExecutorInfo> GetExecutorsFromWorkflowInOrder(Workflow workflow)
     {
-        WorkflowExecutionPlan plan = GetExecutionPlan(workflow);
+        ArgumentNullException.ThrowIfNull(workflow);
 
-        // Flatten the levels into a single list for backward compatibility
+        Dictionary<string, ExecutorBinding> executors = workflow.ReflectExecutors();
         List<WorkflowExecutorInfo> result = [];
-        foreach (WorkflowExecutionLevel level in plan.Levels)
+
+        foreach (KeyValuePair<string, ExecutorBinding> executor in executors)
         {
-            result.AddRange(level.Executors);
+            bool isAgentic = IsAgentExecutorType(executor.Value.ExecutorType);
+            RequestPort? requestPort = (executor.Value is RequestPortBinding rpb) ? rpb.Port : null;
+            Workflow? subWorkflow = (executor.Value is SubworkflowBinding swb) ? swb.WorkflowInstance : null;
+            result.Add(new WorkflowExecutorInfo(executor.Key, isAgentic, requestPort, subWorkflow));
         }
 
         return result;
     }
 
     /// <summary>
-    /// Analyzes the workflow and returns an execution plan that supports Fan-Out/Fan-In patterns.
-    /// Executors at the same level can be executed in parallel (Fan-Out).
-    /// Fan-In points are identified where multiple executors converge.
-    /// Cyclic workflows are detected and marked for message-driven execution.
+    /// Builds the workflow graph information needed for message-driven execution.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This method extracts only the information needed for routing messages:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>Successors and predecessors for each executor</description></item>
+    /// <item><description>Edge conditions for conditional routing</description></item>
+    /// <item><description>Output types for deserialization</description></item>
+    /// </list>
+    /// <para>
+    /// Unlike level-based execution plans, this approach supports cyclic workflows
+    /// naturally through message-driven superstep execution.
+    /// </para>
+    /// </remarks>
     /// <param name="workflow">The workflow instance to analyze.</param>
-    /// <returns>An execution plan with parallel execution levels.</returns>
-    public static WorkflowExecutionPlan GetExecutionPlan(Workflow workflow)
+    /// <returns>A graph info object containing routing information.</returns>
+    public static WorkflowGraphInfo BuildGraphInfo(Workflow workflow)
     {
         ArgumentNullException.ThrowIfNull(workflow);
 
         Dictionary<string, ExecutorBinding> executors = workflow.ReflectExecutors();
         Dictionary<string, HashSet<Edge>> edges = workflow.Edges;
 
-        WorkflowExecutionPlan plan = new()
+        WorkflowGraphInfo graphInfo = new()
         {
             StartExecutorId = workflow.StartExecutorId
         };
 
-        // Build adjacency lists (successors and predecessors)
-        Dictionary<string, List<string>> successors = new(executors.Count);
-        Dictionary<string, List<string>> predecessors = new(executors.Count);
-        Dictionary<string, int> executorIndex = new(executors.Count);
-
-        // Initialize all executors and extract their output types
-        int index = 0;
+        // Initialize successors, predecessors, and extract output types for all executors
         foreach (KeyValuePair<string, ExecutorBinding> executor in executors)
         {
-            executorIndex[executor.Key] = index++;
-            successors[executor.Key] = [];
-            predecessors[executor.Key] = [];
-
-            // Extract output type from executor type (e.g., Executor<TInput, TOutput> -> TOutput)
-            plan.ExecutorOutputTypes[executor.Key] = GetExecutorOutputType(executor.Value.ExecutorType);
+            graphInfo.Successors[executor.Key] = [];
+            graphInfo.Predecessors[executor.Key] = [];
+            graphInfo.ExecutorOutputTypes[executor.Key] = GetExecutorOutputType(executor.Value.ExecutorType);
         }
 
         // Build the graph from edges and extract edge conditions
-        Dictionary<(string SourceId, string TargetId), Func<object?, bool>?> edgeConditions = [];
         foreach (KeyValuePair<string, HashSet<Edge>> edgeGroup in edges)
         {
             string sourceId = edgeGroup.Key;
-            List<string> sourceSuccessors = successors[sourceId];
+            List<string> sourceSuccessors = graphInfo.Successors[sourceId];
 
             foreach (Edge edge in edgeGroup.Value)
             {
                 foreach (string sinkId in edge.Data.Connection.SinkIds)
                 {
-                    if (executorIndex.ContainsKey(sinkId))
+                    if (graphInfo.Successors.ContainsKey(sinkId))
                     {
                         sourceSuccessors.Add(sinkId);
-                        predecessors[sinkId].Add(sourceId);
+                        graphInfo.Predecessors[sinkId].Add(sourceId);
                     }
                 }
 
                 // Extract condition from DirectEdgeData if present
                 DirectEdgeData? directEdge = edge.DirectEdgeData;
-                if (directEdge is not null)
+                if (directEdge?.Condition is not null)
                 {
-                    edgeConditions[(directEdge.SourceId, directEdge.SinkId)] = directEdge.Condition;
+                    graphInfo.EdgeConditions[(directEdge.SourceId, directEdge.SinkId)] = directEdge.Condition;
                 }
             }
         }
 
-        // Detect back-edges using DFS from start executor
-        HashSet<(string Source, string Target)> backEdges = DetectBackEdges(workflow.StartExecutorId, successors);
-
-        // Calculate in-degrees, EXCLUDING back-edges
-        int[] inDegree = new int[executors.Count];
-        foreach (string executorId in executors.Keys)
-        {
-            foreach (string pred in predecessors[executorId])
-            {
-                // Only count edge if it's NOT a back-edge
-                if (!backEdges.Contains((pred, executorId)))
-                {
-                    inDegree[executorIndex[executorId]]++;
-                }
-            }
-        }
-
-        // Store edge conditions in the plan
-        foreach (KeyValuePair<(string SourceId, string TargetId), Func<object?, bool>?> condition in edgeConditions)
-        {
-            plan.EdgeConditions[condition.Key] = condition.Value;
-        }
-
-        // Store the graph structure in the plan
-        foreach (string executorId in executors.Keys)
-        {
-            plan.Predecessors[executorId] = predecessors[executorId];
-            plan.Successors[executorId] = successors[executorId];
-        }
-
-        // Build execution levels using queue-based Kahn's algorithm
-        // Process all nodes with in-degree 0 at once (same level) for parallel execution
-        Queue<string> currentLevel = new();
-        foreach (KeyValuePair<string, int> kvp in executorIndex)
-        {
-            if (inDegree[kvp.Value] == 0)
-            {
-                currentLevel.Enqueue(kvp.Key);
-            }
-        }
-
-        int levelNumber = 0;
-        int processedCount = 0;
-
-        while (currentLevel.Count > 0)
-        {
-            List<WorkflowExecutorInfo> levelExecutors = new(currentLevel.Count);
-            Queue<string> nextLevel = new();
-            bool isFanIn = false;
-
-            while (currentLevel.Count > 0)
-            {
-                string executorId = currentLevel.Dequeue();
-                processedCount++;
-
-                ExecutorBinding executorBinding = executors[executorId];
-                bool isAgentic = IsAgentExecutorType(executorBinding.ExecutorType);
-                RequestPort? requestPort = (executorBinding is RequestPortBinding rpb) ? rpb.Port : null;
-                Workflow? subWorkflow = (executorBinding is SubworkflowBinding swb) ? swb.WorkflowInstance : null;
-                levelExecutors.Add(new WorkflowExecutorInfo(executorId, isAgentic, requestPort, subWorkflow));
-
-                // Check Fan-In for this executor (excluding back-edges)
-                int nonBackEdgePredecessors = predecessors[executorId]
-                    .Count(pred => !backEdges.Contains((pred, executorId)));
-                if (nonBackEdgePredecessors > 1)
-                {
-                    isFanIn = true;
-                }
-
-                // Decrement in-degree of all successors (excluding back-edges) and enqueue those ready for next level
-                foreach (string successor in successors[executorId])
-                {
-                    // Skip back-edges for topological ordering
-                    if (backEdges.Contains((executorId, successor)))
-                    {
-                        continue;
-                    }
-
-                    int successorIdx = executorIndex[successor];
-                    if (--inDegree[successorIdx] == 0)
-                    {
-                        nextLevel.Enqueue(successor);
-                    }
-                }
-            }
-
-            plan.Levels.Add(new WorkflowExecutionLevel(levelNumber, levelExecutors, isFanIn));
-            levelNumber++;
-            currentLevel = nextLevel;
-        }
-
-        // Handle any remaining executors not processed (shouldn't happen if back-edge detection is correct)
-        if (processedCount < executors.Count)
-        {
-            List<WorkflowExecutorInfo> remainingExecutors = [];
-            foreach (KeyValuePair<string, ExecutorBinding> executor in executors)
-            {
-                if (inDegree[executorIndex[executor.Key]] > 0)
-                {
-                    bool isAgentic = IsAgentExecutorType(executor.Value.ExecutorType);
-                    RequestPort? requestPort = (executor.Value is RequestPortBinding rpb) ? rpb.Port : null;
-                    Workflow? subWorkflow = (executor.Value is SubworkflowBinding swb) ? swb.WorkflowInstance : null;
-                    remainingExecutors.Add(new WorkflowExecutorInfo(executor.Key, isAgentic, requestPort, subWorkflow));
-                }
-            }
-
-            if (remainingExecutors.Count > 0)
-            {
-                bool isFanIn = remainingExecutors.Exists(e => predecessors[e.ExecutorId].Count > 1);
-                plan.Levels.Add(new WorkflowExecutionLevel(levelNumber, remainingExecutors, isFanIn));
-            }
-        }
-
-        return plan;
-    }
-
-    /// <summary>
-    /// Detects back-edges in the graph using DFS.
-    /// A back-edge is an edge that points to an ancestor in the DFS tree (creates a cycle).
-    /// </summary>
-    /// <param name="startId">The starting executor ID for DFS traversal.</param>
-    /// <param name="successors">The adjacency list mapping each executor to its successors.</param>
-    /// <returns>A set of back-edges as (source, target) tuples.</returns>
-    private static HashSet<(string Source, string Target)> DetectBackEdges(
-        string startId,
-        Dictionary<string, List<string>> successors)
-    {
-        HashSet<(string, string)> backEdges = [];
-        HashSet<string> visited = [];
-        HashSet<string> inStack = []; // Nodes in current DFS path
-
-        void Dfs(string nodeId)
-        {
-            visited.Add(nodeId);
-            inStack.Add(nodeId);
-
-            if (successors.TryGetValue(nodeId, out List<string>? neighbors))
-            {
-                foreach (string neighbor in neighbors)
-                {
-                    if (inStack.Contains(neighbor))
-                    {
-                        // Edge to ancestor in current path = back-edge (creates cycle)
-                        backEdges.Add((nodeId, neighbor));
-                    }
-                    else if (!visited.Contains(neighbor))
-                    {
-                        Dfs(neighbor);
-                    }
-                }
-            }
-
-            inStack.Remove(nodeId);
-        }
-
-        // Start DFS from the workflow's start executor
-        Dfs(startId);
-
-        // Handle any disconnected components (shouldn't happen in valid workflows, but for safety)
-        foreach (string nodeId in successors.Keys)
-        {
-            if (!visited.Contains(nodeId))
-            {
-                Dfs(nodeId);
-            }
-        }
-
-        return backEdges;
+        return graphInfo;
     }
 
     /// <summary>
@@ -301,9 +127,7 @@ internal static class WorkflowHelper
     /// <returns><c>true</c> if the executor is an agentic executor; otherwise, <c>false</c>.</returns>
     internal static bool IsAgentExecutorType(Type executorType)
     {
-        // hack for now. In the future, the MAF type could expose something which can help with this.
         // Check if the type name or assembly indicates it's an agent executor
-        // This includes AgentRunStreamingExecutor, AgentExecutor, ChatClientAgent wrappers, etc.
         string typeName = executorType.FullName ?? executorType.Name;
         string assemblyName = executorType.Assembly.GetName().Name ?? string.Empty;
 
